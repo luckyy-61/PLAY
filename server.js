@@ -1,17 +1,13 @@
-/**
- * PLAY Music Backend Server
- * -------------------------
- * Node.js + Express server that acts as a proxy to the Invidious API
- * - Completely immune to YouTube datacenter blocks
- * - No yt-dlp dependencies needed
- */
-
 const express = require('express');
 const app = express();
 const PORT = 3000;
 
-// The public API instance we are using
-const INVIDIOUS_URL = 'https://inv.thepixora.com';
+// List of Invidious instances to try in order
+const INVIDIOUS_INSTANCES = [
+  'https://invidious.nerdvpn.de',
+  'https://invidious.f5.si',
+  'https://yt.chocolatemoo53.com',
+];
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -19,7 +15,19 @@ app.use((req, res, next) => {
   next();
 });
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
+// Try each instance until one works
+async function fetchInvidious(path) {
+  for (const base of INVIDIOUS_INSTANCES) {
+    try {
+      const response = await fetch(`${base}${path}`);
+      if (response.ok) return response.json();
+    } catch (e) {
+      console.log(`Instance ${base} failed: ${e.message}`);
+    }
+  }
+  throw new Error('All Invidious instances failed');
+}
+
 function formatDuration(seconds) {
   if (!seconds) return "0:00";
   const m = Math.floor(seconds / 60);
@@ -34,32 +42,23 @@ function formatViews(views) {
   return String(views);
 }
 
-// ─── Search ───────────────────────────────────────────────────────────────────
 app.get('/search', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: 'Query required' });
-
   try {
-    const response = await fetch(`${INVIDIOUS_URL}/api/v1/search?q=${encodeURIComponent(query)}`);
-    if (!response.ok) throw new Error(`API returned ${response.status}`);
-    
-    const data = await response.json();
-    
-    // Format the response to match our Android app's expectations
+    const data = await fetchInvidious(`/api/v1/search?q=${encodeURIComponent(query)}`);
     const results = data
       .filter(item => item.type === 'video')
       .map(item => ({
         videoId: item.videoId,
         title: item.title || 'Unknown',
         artist: item.author || 'Unknown Artist',
-        thumbnailUrl: item.videoThumbnails?.find(t => t.quality === 'mqdefault')?.url 
-                      || item.videoThumbnails?.[0]?.url 
+        thumbnailUrl: item.videoThumbnails?.find(t => t.quality === 'mqdefault')?.url
                       || `https://i.ytimg.com/vi/${item.videoId}/mqdefault.jpg`,
         duration: formatDuration(item.lengthSeconds),
         views: formatViews(item.viewCount)
       }))
-      .slice(0, 15); // limit to 15 results
-
+      .slice(0, 15);
     res.json(results);
   } catch (error) {
     console.error('Search error:', error.message);
@@ -67,33 +66,14 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ─── Get Audio Stream URL ─────────────────────────────────────────────────────
 app.get('/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
-
   try {
-    const response = await fetch(`${INVIDIOUS_URL}/api/v1/videos/${videoId}`);
-    if (!response.ok) throw new Error(`API returned ${response.status}`);
-    
-    const data = await response.json();
-    
-    // Find the best audio-only stream (preferably opus/webm)
-    const audioStreams = data.formatStreams || [];
-    let streamUrl = '';
-    
-    if (audioStreams.length > 0) {
-        // Try to get audio-only streams
-        const audioOnly = audioStreams.filter(s => s.type && s.type.includes('audio'));
-        if (audioOnly.length > 0) {
-            streamUrl = audioOnly[0].url;
-        } else {
-            // Fallback to the lowest quality video if no audio-only stream is found
-            streamUrl = audioStreams[audioStreams.length - 1].url;
-        }
-    } else {
-        throw new Error('No audio streams available for this video');
-    }
-
+    const data = await fetchInvidious(`/api/v1/videos/${videoId}`);
+    const streams = data.formatStreams || [];
+    if (streams.length === 0) throw new Error('No streams available');
+    const audioOnly = streams.filter(s => s.type && s.type.includes('audio'));
+    const streamUrl = audioOnly.length > 0 ? audioOnly[0].url : streams[streams.length - 1].url;
     res.json({
       videoId,
       streamUrl,
@@ -108,73 +88,48 @@ app.get('/stream/:videoId', async (req, res) => {
   }
 });
 
-// ─── Trending ─────────────────────────────────────────────────────────────────
-const TRENDING_QUERIES = [
-  'top hits 2024',
-  'bollywood hits 2024',
-  'trending songs today',
-  'new songs 2024',
-  'most popular songs'
-];
+const TRENDING_QUERIES = ['top hits 2024', 'bollywood hits 2024', 'trending songs today', 'new songs 2024', 'most popular songs'];
 
 app.get('/trending', async (req, res) => {
   try {
     const query = TRENDING_QUERIES[Math.floor(Math.random() * TRENDING_QUERIES.length)];
-    const response = await fetch(`${INVIDIOUS_URL}/api/v1/search?q=${encodeURIComponent(query)}`);
-    if (!response.ok) throw new Error(`API returned ${response.status}`);
-    
-    const data = await response.json();
-    
+    const data = await fetchInvidious(`/api/v1/search?q=${encodeURIComponent(query)}`);
     const results = data
       .filter(item => item.type === 'video')
       .map(item => ({
         videoId: item.videoId,
         title: item.title || 'Unknown',
         artist: item.author || 'Unknown Artist',
-        thumbnailUrl: item.videoThumbnails?.find(t => t.quality === 'mqdefault')?.url 
-                      || item.videoThumbnails?.[0]?.url 
+        thumbnailUrl: item.videoThumbnails?.find(t => t.quality === 'mqdefault')?.url
                       || `https://i.ytimg.com/vi/${item.videoId}/mqdefault.jpg`,
         duration: formatDuration(item.lengthSeconds),
         views: formatViews(item.viewCount)
       }))
       .slice(0, 15);
-
     res.json(results);
   } catch (error) {
-    res.status(500).json({ error: 'Failed to load trending' });
+    res.status(500).json({ error: 'Failed to load trending', message: error.message });
   }
 });
 
-// ─── Audio Proxy ──────────────────────────────────────────────────────────────
 app.get('/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
   try {
-    const response = await fetch(`${INVIDIOUS_URL}/api/v1/videos/${videoId}`);
-    const data = await response.json();
-    
-    const audioStreams = data.formatStreams || [];
-    let streamUrl = '';
-    
-    if (audioStreams.length > 0) {
-        const audioOnly = audioStreams.filter(s => s.type && s.type.includes('audio'));
-        streamUrl = audioOnly.length > 0 ? audioOnly[0].url : audioStreams[audioStreams.length - 1].url;
-    } else {
-        throw new Error('No streams');
-    }
-    
+    const data = await fetchInvidious(`/api/v1/videos/${videoId}`);
+    const streams = data.formatStreams || [];
+    if (streams.length === 0) throw new Error('No streams');
+    const audioOnly = streams.filter(s => s.type && s.type.includes('audio'));
+    const streamUrl = audioOnly.length > 0 ? audioOnly[0].url : streams[streams.length - 1].url;
     res.redirect(streamUrl);
   } catch (error) {
     res.status(500).json({ error: 'Proxy failed' });
   }
 });
 
-// ─── Health Check ─────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', app: 'PLAY Music Backend', port: PORT });
 });
 
-// ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('\n🎵 PLAY Music Backend running (Invidious API Mode)!');
-  console.log(`   Network:  http://[your-ip]:${PORT}`);
+  console.log('\n🎵 PLAY Music Backend running!');
 });
