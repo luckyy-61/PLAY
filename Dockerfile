@@ -1,4 +1,4 @@
-FROM node:20-bullseye-slim
+FROM node:20-bookworm-slim
 
 # Install Python, ffmpeg, and curl
 RUN apt-get update && \
