@@ -1,13 +1,19 @@
+/**
+ * PLAY Music Backend Server
+ * -------------------------
+ * Uses yt-dlp with YouTube cookies for authenticated streaming.
+ * Cookies are loaded from YT_COOKIES environment variable (set in Render dashboard).
+ */
+
 const express = require('express');
+const { exec } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
 const app = express();
 const PORT = 3000;
-
-// List of Invidious instances to try in order
-const INVIDIOUS_INSTANCES = [
-  'https://invidious.nerdvpn.de',
-  'https://invidious.f5.si',
-  'https://yt.chocolatemoo53.com',
-];
+const COOKIES_PATH = path.join(os.tmpdir(), 'yt_cookies.txt');
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -15,28 +21,36 @@ app.use((req, res, next) => {
   next();
 });
 
-// Try each instance until one works
-async function fetchInvidious(path) {
-  for (const base of INVIDIOUS_INSTANCES) {
-    try {
-      const response = await fetch(`${base}${path}`);
-      if (response.ok) return response.json();
-    } catch (e) {
-      console.log(`Instance ${base} failed: ${e.message}`);
-    }
+function setupCookies() {
+  const cookieData = process.env.YT_COOKIES;
+  if (cookieData) {
+    fs.writeFileSync(COOKIES_PATH, cookieData, 'utf8');
+    console.log('✅ YouTube cookies loaded from environment variable.');
+  } else {
+    console.warn('⚠️  YT_COOKIES not set. Streams may fail.');
   }
-  throw new Error('All Invidious instances failed');
+}
+
+function ytdlp(args) {
+  const cookieArg = fs.existsSync(COOKIES_PATH) ? `--cookies "${COOKIES_PATH}"` : '';
+  const cmd = `yt-dlp ${cookieArg} ${args}`;
+  return new Promise((resolve, reject) => {
+    exec(cmd, { maxBuffer: 10 * 1024 * 1024, timeout: 45000 }, (err, stdout, stderr) => {
+      if (err) return reject(new Error(stderr || err.message));
+      resolve(stdout.trim());
+    });
+  });
 }
 
 function formatDuration(seconds) {
-  if (!seconds) return "0:00";
+  if (!seconds) return '0:00';
   const m = Math.floor(seconds / 60);
   const s = seconds % 60;
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
 function formatViews(views) {
-  if (!views) return "0";
+  if (!views) return '0';
   if (views >= 1_000_000) return `${(views / 1_000_000).toFixed(1)}M`;
   if (views >= 1_000) return `${(views / 1_000).toFixed(1)}K`;
   return String(views);
@@ -46,22 +60,23 @@ app.get('/search', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: 'Query required' });
   try {
-    const data = await fetchInvidious(`/api/v1/search?q=${encodeURIComponent(query)}`);
-    const results = data
-      .filter(item => item.type === 'video')
-      .map(item => ({
-        videoId: item.videoId,
-        title: item.title || 'Unknown',
-        artist: item.author || 'Unknown Artist',
-        thumbnailUrl: item.videoThumbnails?.find(t => t.quality === 'mqdefault')?.url
-                      || `https://i.ytimg.com/vi/${item.videoId}/mqdefault.jpg`,
-        duration: formatDuration(item.lengthSeconds),
-        views: formatViews(item.viewCount)
-      }))
-      .slice(0, 15);
+    const raw = await ytdlp(
+      `"ytsearch15:${query.replace(/"/g, '')}" --dump-json --flat-playlist --no-warnings --no-playlist`
+    );
+    const results = raw.split('\n').filter(Boolean).map(line => {
+      try {
+        const info = JSON.parse(line);
+        return {
+          videoId: info.id, title: info.title || 'Unknown',
+          artist: info.channel || info.uploader || 'Unknown Artist',
+          thumbnailUrl: `https://i.ytimg.com/vi/${info.id}/mqdefault.jpg`,
+          duration: formatDuration(info.duration || 0),
+          views: formatViews(info.view_count || 0)
+        };
+      } catch (e) { return null; }
+    }).filter(Boolean);
     res.json(results);
   } catch (error) {
-    console.error('Search error:', error.message);
     res.status(500).json({ error: 'Search failed', message: error.message });
   }
 });
@@ -69,67 +84,53 @@ app.get('/search', async (req, res) => {
 app.get('/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
   try {
-    const data = await fetchInvidious(`/api/v1/videos/${videoId}`);
-    const streams = data.formatStreams || [];
-    if (streams.length === 0) throw new Error('No streams available');
-    const audioOnly = streams.filter(s => s.type && s.type.includes('audio'));
-    const streamUrl = audioOnly.length > 0 ? audioOnly[0].url : streams[streams.length - 1].url;
+    const raw = await ytdlp(
+      `https://www.youtube.com/watch?v=${videoId} -f "bestaudio[ext=webm]/bestaudio/best" --get-url --no-warnings --no-playlist`
+    );
+    const streamUrl = raw.split('\n')[0].trim();
+    const metaRaw = await ytdlp(
+      `https://www.youtube.com/watch?v=${videoId} --dump-json --no-warnings --no-playlist --skip-download`
+    );
+    const meta = JSON.parse(metaRaw);
     res.json({
-      videoId,
-      streamUrl,
-      title: data.title || 'Unknown',
-      artist: data.author || 'Unknown Artist',
+      videoId, streamUrl,
+      title: meta.title || 'Unknown',
+      artist: meta.channel || meta.uploader || 'Unknown Artist',
       thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
-      duration: data.lengthSeconds || 0
+      duration: meta.duration || 0
     });
   } catch (error) {
-    console.error('Stream error:', error.message);
     res.status(500).json({ error: 'Failed to get stream', message: error.message });
   }
 });
 
-const TRENDING_QUERIES = ['top hits 2024', 'bollywood hits 2024', 'trending songs today', 'new songs 2024', 'most popular songs'];
+const TRENDING_QUERIES = ['top hits 2025', 'bollywood hits 2025', 'trending songs today', 'new songs 2025', 'most popular songs'];
 
 app.get('/trending', async (req, res) => {
   try {
     const query = TRENDING_QUERIES[Math.floor(Math.random() * TRENDING_QUERIES.length)];
-    const data = await fetchInvidious(`/api/v1/search?q=${encodeURIComponent(query)}`);
-    const results = data
-      .filter(item => item.type === 'video')
-      .map(item => ({
-        videoId: item.videoId,
-        title: item.title || 'Unknown',
-        artist: item.author || 'Unknown Artist',
-        thumbnailUrl: item.videoThumbnails?.find(t => t.quality === 'mqdefault')?.url
-                      || `https://i.ytimg.com/vi/${item.videoId}/mqdefault.jpg`,
-        duration: formatDuration(item.lengthSeconds),
-        views: formatViews(item.viewCount)
-      }))
-      .slice(0, 15);
+    const raw = await ytdlp(`"ytsearch20:${query}" --dump-json --flat-playlist --no-warnings --no-playlist`);
+    const results = raw.split('\n').filter(Boolean).map(line => {
+      try {
+        const info = JSON.parse(line);
+        return {
+          videoId: info.id, title: info.title || 'Unknown',
+          artist: info.channel || info.uploader || 'Unknown Artist',
+          thumbnailUrl: `https://i.ytimg.com/vi/${info.id}/mqdefault.jpg`,
+          duration: formatDuration(info.duration || 0),
+          views: formatViews(info.view_count || 0)
+        };
+      } catch (e) { return null; }
+    }).filter(Boolean);
     res.json(results);
   } catch (error) {
-    res.status(500).json({ error: 'Failed to load trending', message: error.message });
-  }
-});
-
-app.get('/proxy/:videoId', async (req, res) => {
-  const { videoId } = req.params;
-  try {
-    const data = await fetchInvidious(`/api/v1/videos/${videoId}`);
-    const streams = data.formatStreams || [];
-    if (streams.length === 0) throw new Error('No streams');
-    const audioOnly = streams.filter(s => s.type && s.type.includes('audio'));
-    const streamUrl = audioOnly.length > 0 ? audioOnly[0].url : streams[streams.length - 1].url;
-    res.redirect(streamUrl);
-  } catch (error) {
-    res.status(500).json({ error: 'Proxy failed' });
+    res.status(500).json({ error: 'Failed to load trending' });
   }
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', app: 'PLAY Music Backend', port: PORT });
+  res.json({ status: 'ok', cookies: fs.existsSync(COOKIES_PATH) ? 'loaded' : 'missing' });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-  console.log('\n🎵 PLAY Music Backend running!');
-});
+setupCookies();
+app.listen(PORT, '0.0.0.0', () => console.log(`\n🎵 PLAY Music Backend running on port ${PORT}`));
