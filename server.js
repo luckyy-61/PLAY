@@ -44,7 +44,7 @@ app.get('/search', async (req, res) => {
   try {
     // Search YouTube, get top 15 results as JSON
     const raw = await ytdlp(
-      `"ytsearch15:${query.replace(/"/g, '')}" --dump-json --flat-playlist --no-warnings --no-check-certificates --no-playlist`
+      `"ytsearch15:${query.replace(/"/g, '')}" --dump-json --flat-playlist --no-warnings --no-check-certificates --no-playlist --extractor-args "youtube:player_client=android,web"`
     );
 
     const lines = raw.split('\n').filter(Boolean);
@@ -78,14 +78,14 @@ app.get('/stream/:videoId', async (req, res) => {
   try {
     // Get audio-only stream info (Opus/WebM — no video data!)
     const raw = await ytdlp(
-      `https://www.youtube.com/watch?v=${videoId} -f "bestaudio[ext=webm]/bestaudio/best" --get-url --no-warnings --no-check-certificates --no-playlist`
+      `https://www.youtube.com/watch?v=${videoId} -f "bestaudio[ext=webm]/bestaudio/best" --get-url --no-warnings --no-check-certificates --no-playlist --extractor-args "youtube:player_client=android,web"`
     );
 
     const streamUrl = raw.split('\n')[0].trim();
 
     // Also get metadata
     const metaRaw = await ytdlp(
-      `https://www.youtube.com/watch?v=${videoId} --dump-json --no-warnings --no-check-certificates --no-playlist --skip-download`
+      `https://www.youtube.com/watch?v=${videoId} --dump-json --no-warnings --no-check-certificates --no-playlist --skip-download --extractor-args "youtube:player_client=android,web"`
     );
     const meta = JSON.parse(metaRaw);
 
@@ -116,7 +116,7 @@ app.get('/trending', async (req, res) => {
   try {
     const query = TRENDING_QUERIES[Math.floor(Math.random() * TRENDING_QUERIES.length)];
     const raw = await ytdlp(
-      `"ytsearch20:${query}" --dump-json --flat-playlist --no-warnings --no-check-certificates --no-playlist`
+      `"ytsearch20:${query}" --dump-json --flat-playlist --no-warnings --no-check-certificates --no-playlist --extractor-args "youtube:player_client=android,web"`
     );
     const lines = raw.split('\n').filter(Boolean);
     const results = lines.map(line => {
@@ -144,7 +144,7 @@ app.get('/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
   try {
     const raw = await ytdlp(
-      `https://www.youtube.com/watch?v=${videoId} -f "bestaudio[ext=webm]/bestaudio/best" --get-url --no-warnings --no-check-certificates`
+      `https://www.youtube.com/watch?v=${videoId} -f "bestaudio[ext=webm]/bestaudio/best" --get-url --no-warnings --no-check-certificates --extractor-args "youtube:player_client=android,web"`
     );
     const streamUrl = raw.split('\n')[0].trim();
     res.redirect(streamUrl);
