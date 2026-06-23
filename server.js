@@ -1,21 +1,17 @@
 /**
  * PLAY Music Backend Server
  * -------------------------
- * Node.js + Express server that uses yt-dlp to:
- * - Search YouTube for songs
- * - Return audio-only stream URLs (Opus/WebM, ~130kbps)
- * - NO video data — low bandwidth, works on slow connections
- * 
- * Run: npm install && node server.js
+ * Node.js + Express server that acts as a proxy to the Invidious API
+ * - Completely immune to YouTube datacenter blocks
+ * - No yt-dlp dependencies needed
  */
 
 const express = require('express');
-const { exec, execSync } = require('child_process');
-const path = require('path');
-const fs = require('fs');
-
 const app = express();
 const PORT = 3000;
+
+// The public API instance we are using
+const INVIDIOUS_URL = 'https://inv.thepixora.com';
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -23,17 +19,19 @@ app.use((req, res, next) => {
   next();
 });
 
-const YTDLP = process.platform === 'win32'
-  ? path.join(__dirname, 'yt-dlp.exe')
-  : 'yt-dlp';
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+function formatDuration(seconds) {
+  if (!seconds) return "0:00";
+  const m = Math.floor(seconds / 60);
+  const s = seconds % 60;
+  return `${m}:${s.toString().padStart(2, '0')}`;
+}
 
-function ytdlp(args) {
-  return new Promise((resolve, reject) => {
-    exec(`"${YTDLP}" ${args}`, { maxBuffer: 10 * 1024 * 1024, timeout: 30000 }, (err, stdout, stderr) => {
-      if (err) return reject(new Error(stderr || err.message));
-      resolve(stdout.trim());
-    });
-  });
+function formatViews(views) {
+  if (!views) return "0";
+  if (views >= 1_000_000) return `${(views / 1_000_000).toFixed(1)}M`;
+  if (views >= 1_000) return `${(views / 1_000).toFixed(1)}K`;
+  return String(views);
 }
 
 // ─── Search ───────────────────────────────────────────────────────────────────
@@ -42,27 +40,25 @@ app.get('/search', async (req, res) => {
   if (!query) return res.status(400).json({ error: 'Query required' });
 
   try {
-    // Search YouTube, get top 15 results as JSON
-    const raw = await ytdlp(
-      `"ytsearch15:${query.replace(/"/g, '')}" --dump-json --flat-playlist --no-warnings --no-check-certificates --no-playlist --extractor-args "youtube:player_client=android,web"`
-    );
-
-    const lines = raw.split('\n').filter(Boolean);
-    const results = lines.map(line => {
-      try {
-        const info = JSON.parse(line);
-        return {
-          videoId: info.id,
-          title: info.title || 'Unknown',
-          artist: info.channel || info.uploader || 'Unknown Artist',
-          thumbnailUrl: `https://i.ytimg.com/vi/${info.id}/mqdefault.jpg`,
-          duration: formatDuration(info.duration || 0),
-          views: formatViews(info.view_count || 0)
-        };
-      } catch (e) {
-        return null;
-      }
-    }).filter(Boolean);
+    const response = await fetch(`${INVIDIOUS_URL}/api/v1/search?q=${encodeURIComponent(query)}`);
+    if (!response.ok) throw new Error(`API returned ${response.status}`);
+    
+    const data = await response.json();
+    
+    // Format the response to match our Android app's expectations
+    const results = data
+      .filter(item => item.type === 'video')
+      .map(item => ({
+        videoId: item.videoId,
+        title: item.title || 'Unknown',
+        artist: item.author || 'Unknown Artist',
+        thumbnailUrl: item.videoThumbnails?.find(t => t.quality === 'mqdefault')?.url 
+                      || item.videoThumbnails?.[0]?.url 
+                      || `https://i.ytimg.com/vi/${item.videoId}/mqdefault.jpg`,
+        duration: formatDuration(item.lengthSeconds),
+        views: formatViews(item.viewCount)
+      }))
+      .slice(0, 15); // limit to 15 results
 
     res.json(results);
   } catch (error) {
@@ -76,26 +72,35 @@ app.get('/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
 
   try {
-    // Get audio-only stream info (Opus/WebM — no video data!)
-    const raw = await ytdlp(
-      `https://www.youtube.com/watch?v=${videoId} -f "bestaudio[ext=webm]/bestaudio/best" --get-url --no-warnings --no-check-certificates --no-playlist --extractor-args "youtube:player_client=android,web"`
-    );
-
-    const streamUrl = raw.split('\n')[0].trim();
-
-    // Also get metadata
-    const metaRaw = await ytdlp(
-      `https://www.youtube.com/watch?v=${videoId} --dump-json --no-warnings --no-check-certificates --no-playlist --skip-download --extractor-args "youtube:player_client=android,web"`
-    );
-    const meta = JSON.parse(metaRaw);
+    const response = await fetch(`${INVIDIOUS_URL}/api/v1/videos/${videoId}`);
+    if (!response.ok) throw new Error(`API returned ${response.status}`);
+    
+    const data = await response.json();
+    
+    // Find the best audio-only stream (preferably opus/webm)
+    const audioStreams = data.formatStreams || [];
+    let streamUrl = '';
+    
+    if (audioStreams.length > 0) {
+        // Try to get audio-only streams
+        const audioOnly = audioStreams.filter(s => s.type && s.type.includes('audio'));
+        if (audioOnly.length > 0) {
+            streamUrl = audioOnly[0].url;
+        } else {
+            // Fallback to the lowest quality video if no audio-only stream is found
+            streamUrl = audioStreams[audioStreams.length - 1].url;
+        }
+    } else {
+        throw new Error('No audio streams available for this video');
+    }
 
     res.json({
       videoId,
       streamUrl,
-      title: meta.title || 'Unknown',
-      artist: meta.channel || meta.uploader || 'Unknown Artist',
+      title: data.title || 'Unknown',
+      artist: data.author || 'Unknown Artist',
       thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
-      duration: meta.duration || 0
+      duration: data.lengthSeconds || 0
     });
   } catch (error) {
     console.error('Stream error:', error.message);
@@ -115,23 +120,24 @@ const TRENDING_QUERIES = [
 app.get('/trending', async (req, res) => {
   try {
     const query = TRENDING_QUERIES[Math.floor(Math.random() * TRENDING_QUERIES.length)];
-    const raw = await ytdlp(
-      `"ytsearch20:${query}" --dump-json --flat-playlist --no-warnings --no-check-certificates --no-playlist --extractor-args "youtube:player_client=android,web"`
-    );
-    const lines = raw.split('\n').filter(Boolean);
-    const results = lines.map(line => {
-      try {
-        const info = JSON.parse(line);
-        return {
-          videoId: info.id,
-          title: info.title || 'Unknown',
-          artist: info.channel || info.uploader || 'Unknown Artist',
-          thumbnailUrl: `https://i.ytimg.com/vi/${info.id}/mqdefault.jpg`,
-          duration: formatDuration(info.duration || 0),
-          views: formatViews(info.view_count || 0)
-        };
-      } catch (e) { return null; }
-    }).filter(Boolean);
+    const response = await fetch(`${INVIDIOUS_URL}/api/v1/search?q=${encodeURIComponent(query)}`);
+    if (!response.ok) throw new Error(`API returned ${response.status}`);
+    
+    const data = await response.json();
+    
+    const results = data
+      .filter(item => item.type === 'video')
+      .map(item => ({
+        videoId: item.videoId,
+        title: item.title || 'Unknown',
+        artist: item.author || 'Unknown Artist',
+        thumbnailUrl: item.videoThumbnails?.find(t => t.quality === 'mqdefault')?.url 
+                      || item.videoThumbnails?.[0]?.url 
+                      || `https://i.ytimg.com/vi/${item.videoId}/mqdefault.jpg`,
+        duration: formatDuration(item.lengthSeconds),
+        views: formatViews(item.viewCount)
+      }))
+      .slice(0, 15);
 
     res.json(results);
   } catch (error) {
@@ -139,14 +145,23 @@ app.get('/trending', async (req, res) => {
   }
 });
 
-// ─── Audio Proxy (optional — streams audio via server for CORS) ───────────────
+// ─── Audio Proxy ──────────────────────────────────────────────────────────────
 app.get('/proxy/:videoId', async (req, res) => {
   const { videoId } = req.params;
   try {
-    const raw = await ytdlp(
-      `https://www.youtube.com/watch?v=${videoId} -f "bestaudio[ext=webm]/bestaudio/best" --get-url --no-warnings --no-check-certificates --extractor-args "youtube:player_client=android,web"`
-    );
-    const streamUrl = raw.split('\n')[0].trim();
+    const response = await fetch(`${INVIDIOUS_URL}/api/v1/videos/${videoId}`);
+    const data = await response.json();
+    
+    const audioStreams = data.formatStreams || [];
+    let streamUrl = '';
+    
+    if (audioStreams.length > 0) {
+        const audioOnly = audioStreams.filter(s => s.type && s.type.includes('audio'));
+        streamUrl = audioOnly.length > 0 ? audioOnly[0].url : audioStreams[audioStreams.length - 1].url;
+    } else {
+        throw new Error('No streams');
+    }
+    
     res.redirect(streamUrl);
   } catch (error) {
     res.status(500).json({ error: 'Proxy failed' });
@@ -158,24 +173,8 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', app: 'PLAY Music Backend', port: PORT });
 });
 
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function formatDuration(seconds) {
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
-  return `${m}:${s.toString().padStart(2, '0')}`;
-}
-
-function formatViews(views) {
-  if (views >= 1_000_000) return `${(views / 1_000_000).toFixed(1)}M`;
-  if (views >= 1_000) return `${(views / 1_000).toFixed(1)}K`;
-  return String(views);
-}
-
 // ─── Start ────────────────────────────────────────────────────────────────────
 app.listen(PORT, '0.0.0.0', () => {
-  console.log('\n🎵 PLAY Music Backend running!');
-  console.log(`   Local:    http://localhost:${PORT}`);
+  console.log('\n🎵 PLAY Music Backend running (Invidious API Mode)!');
   console.log(`   Network:  http://[your-ip]:${PORT}`);
-  console.log('\n   For Android Emulator: already configured (10.0.2.2)');
-  console.log('   For Real Device: set your PC IP in ApiClient.kt\n');
 });
