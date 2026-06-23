@@ -21,16 +21,18 @@ app.use((req, res, next) => {
   next();
 });
 
+// ─── Write cookies from environment variable to a temp file ───────────────────
 function setupCookies() {
   const cookieData = process.env.YT_COOKIES;
   if (cookieData) {
     fs.writeFileSync(COOKIES_PATH, cookieData, 'utf8');
     console.log('✅ YouTube cookies loaded from environment variable.');
   } else {
-    console.warn('⚠️  YT_COOKIES not set. Streams may fail.');
+    console.warn('⚠️  YT_COOKIES environment variable not set. Streams may fail.');
   }
 }
 
+// ─── yt-dlp wrapper ───────────────────────────────────────────────────────────
 function ytdlp(args) {
   const cookieArg = fs.existsSync(COOKIES_PATH) ? `--cookies "${COOKIES_PATH}"` : '';
   const cmd = `yt-dlp ${cookieArg} ${args}`;
@@ -42,6 +44,7 @@ function ytdlp(args) {
   });
 }
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
 function formatDuration(seconds) {
   if (!seconds) return '0:00';
   const m = Math.floor(seconds / 60);
@@ -56,6 +59,7 @@ function formatViews(views) {
   return String(views);
 }
 
+// ─── Search ───────────────────────────────────────────────────────────────────
 app.get('/search', async (req, res) => {
   const query = req.query.q;
   if (!query) return res.status(400).json({ error: 'Query required' });
@@ -63,11 +67,13 @@ app.get('/search', async (req, res) => {
     const raw = await ytdlp(
       `"ytsearch15:${query.replace(/"/g, '')}" --dump-json --flat-playlist --no-warnings --no-playlist`
     );
-    const results = raw.split('\n').filter(Boolean).map(line => {
+    const lines = raw.split('\n').filter(Boolean);
+    const results = lines.map(line => {
       try {
         const info = JSON.parse(line);
         return {
-          videoId: info.id, title: info.title || 'Unknown',
+          videoId: info.id,
+          title: info.title || 'Unknown',
           artist: info.channel || info.uploader || 'Unknown Artist',
           thumbnailUrl: `https://i.ytimg.com/vi/${info.id}/mqdefault.jpg`,
           duration: formatDuration(info.duration || 0),
@@ -77,44 +83,58 @@ app.get('/search', async (req, res) => {
     }).filter(Boolean);
     res.json(results);
   } catch (error) {
+    console.error('Search error:', error.message);
     res.status(500).json({ error: 'Search failed', message: error.message });
   }
 });
 
+// ─── Stream ───────────────────────────────────────────────────────────────────
 app.get('/stream/:videoId', async (req, res) => {
   const { videoId } = req.params;
   try {
     const raw = await ytdlp(
-      `https://www.youtube.com/watch?v=${videoId} -f "bestaudio[ext=webm]/bestaudio/best" --get-url --no-warnings --no-playlist`
+      `https://www.youtube.com/watch?v=${videoId} -f ba --get-url --no-warnings --no-playlist`
     );
     const streamUrl = raw.split('\n')[0].trim();
+
     const metaRaw = await ytdlp(
       `https://www.youtube.com/watch?v=${videoId} --dump-json --no-warnings --no-playlist --skip-download`
     );
     const meta = JSON.parse(metaRaw);
+
     res.json({
-      videoId, streamUrl,
+      videoId,
+      streamUrl,
       title: meta.title || 'Unknown',
       artist: meta.channel || meta.uploader || 'Unknown Artist',
       thumbnailUrl: `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`,
       duration: meta.duration || 0
     });
   } catch (error) {
+    console.error('Stream error:', error.message);
     res.status(500).json({ error: 'Failed to get stream', message: error.message });
   }
 });
 
-const TRENDING_QUERIES = ['top hits 2025', 'bollywood hits 2025', 'trending songs today', 'new songs 2025', 'most popular songs'];
+// ─── Trending ─────────────────────────────────────────────────────────────────
+const TRENDING_QUERIES = [
+  'top hits 2025', 'bollywood hits 2025', 'trending songs today',
+  'new songs 2025', 'most popular songs'
+];
 
 app.get('/trending', async (req, res) => {
   try {
     const query = TRENDING_QUERIES[Math.floor(Math.random() * TRENDING_QUERIES.length)];
-    const raw = await ytdlp(`"ytsearch20:${query}" --dump-json --flat-playlist --no-warnings --no-playlist`);
-    const results = raw.split('\n').filter(Boolean).map(line => {
+    const raw = await ytdlp(
+      `"ytsearch20:${query}" --dump-json --flat-playlist --no-warnings --no-playlist`
+    );
+    const lines = raw.split('\n').filter(Boolean);
+    const results = lines.map(line => {
       try {
         const info = JSON.parse(line);
         return {
-          videoId: info.id, title: info.title || 'Unknown',
+          videoId: info.id,
+          title: info.title || 'Unknown',
           artist: info.channel || info.uploader || 'Unknown Artist',
           thumbnailUrl: `https://i.ytimg.com/vi/${info.id}/mqdefault.jpg`,
           duration: formatDuration(info.duration || 0),
@@ -128,9 +148,17 @@ app.get('/trending', async (req, res) => {
   }
 });
 
+// ─── Health Check ─────────────────────────────────────────────────────────────
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', cookies: fs.existsSync(COOKIES_PATH) ? 'loaded' : 'missing' });
+  res.json({
+    status: 'ok',
+    app: 'PLAY Music Backend',
+    cookies: fs.existsSync(COOKIES_PATH) ? 'loaded' : 'missing'
+  });
 });
 
+// ─── Start ────────────────────────────────────────────────────────────────────
 setupCookies();
-app.listen(PORT, '0.0.0.0', () => console.log(`\n🎵 PLAY Music Backend running on port ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`\n🎵 PLAY Music Backend running on port ${PORT}`);
+});
