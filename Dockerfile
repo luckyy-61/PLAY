@@ -1,7 +1,9 @@
-FROM node:20-alpine
+FROM node:20-bullseye-slim
 
-# Install Python and ffmpeg required for yt-dlp
-RUN apk add --no-cache python3 py3-pip ffmpeg curl
+# Install Python, ffmpeg, and curl
+RUN apt-get update && \
+    apt-get install -y python3 ffmpeg curl && \
+    rm -rf /var/lib/apt/lists/*
 
 # Download and install the latest Linux version of yt-dlp
 RUN curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && \
